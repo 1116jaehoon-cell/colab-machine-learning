@@ -1,0 +1,192 @@
+"""실습 01 — 학습 전에 데이터가 깨지지 않았는지 검사합니다.
+
+왜 먼저 돌리는가:
+    모델 코드가 완벽해도 이미지와 라벨의 대응이 어긋나 있으면
+    학습은 조용히 돌아가고 점수만 이상하게 나옵니다.
+    특히 experiment_id 누수는 Validation 점수를 실제보다 훨씬 높게 만들어
+    '잘 되는 줄 알았는데 비공개 Test에서 무너지는' 대표 원인입니다.
+
+사용법:
+    python check_data.py --data-root data
+"""
+
+import argparse
+import sys
+from collections import Counter
+from pathlib import Path
+
+import pandas as pd
+
+SPLITS_WITH_LABELS = ["train", "public_val"]
+SPLIT_TEST = "private_test"
+VALID_TARGETS = {0, 1, 2}
+
+
+def check_split(data_root: Path, split: str, has_labels: bool):
+    """한 분할을 검사하고 (문제 목록, 요약 정보)를 돌려줍니다."""
+    problems = []
+    split_dir = data_root / split
+    image_dir = split_dir / "images"
+
+    if not image_dir.is_dir():
+        return [f"[{split}] 이미지 폴더 없음: {image_dir}"], None
+
+    files = {p.name for p in image_dir.glob("*.png")}  # 실제로 존재하는 이미지 파일명 집합
+    info = {
+        "split": split,
+        "n_images": len(files),
+        "image_names": files,
+        "experiment_ids": set(),
+    }
+
+    if not has_labels:
+        print(f"[{split}] 이미지 {len(files)}장 (정답 비공개)")
+        return problems, info
+
+    label_path = split_dir / "labels.csv"
+    if not label_path.is_file():
+        return [f"[{split}] labels.csv 없음: {label_path}"], info
+
+    df = pd.read_csv(label_path)
+
+    for col in ["image_name", "target", "experiment_id"]:  # 필수 열이 하나라도 빠지면 이후 검사 불가
+        if col not in df.columns:
+            problems.append(f"[{split}] labels.csv 에 '{col}' 열이 없습니다")
+    if problems:
+        return problems, info
+
+    if df.empty:
+        problems.append(f"[{split}] labels.csv 에 라벨 행이 없습니다")
+        return problems, info
+
+    if df["image_name"].isna().any():
+        problems.append(f"[{split}] image_name 에 빈 값이 있습니다")
+    if df["experiment_id"].isna().any() or df["experiment_id"].astype(str).str.strip().eq("").any():
+        problems.append(f"[{split}] experiment_id 에 빈 값이 있습니다")
+
+    listed = set(df["image_name"].dropna().astype(str))
+    missing = listed - files  # labels.csv 에는 있는데 실제 이미지 파일이 없는 경우
+    if missing:
+        problems.append(
+            f"[{split}] labels.csv 에 있으나 파일이 없는 이미지 {len(missing)}장 "
+            f"(예: {sorted(missing)[:3]})"
+        )
+
+    orphan = files - listed  # 이미지 파일은 있는데 labels.csv 에 등록되지 않은 경우
+    if orphan:
+        problems.append(
+            f"[{split}] 파일은 있으나 labels.csv 에 없는 이미지 {len(orphan)}장 "
+            f"(예: {sorted(orphan)[:3]})"
+        )
+
+    dup = df["image_name"].duplicated().sum()  # 같은 파일명이 두 번 이상 등록된 경우
+    if dup:
+        problems.append(f"[{split}] labels.csv 에 중복된 image_name {dup}건")
+
+    if df["target"].isna().any():
+        problems.append(f"[{split}] target 에 빈 값이 있습니다")
+    bad = set(df["target"].dropna().unique()) - VALID_TARGETS  # 0/1/2 이외의 값이 섞여있는 경우
+    if bad:
+        problems.append(f"[{split}] target 에 허용되지 않은 값: {sorted(bad)}")
+
+    counts = Counter(df["target"])
+    info["n_rows"] = len(df)
+    info["class_counts"] = {int(k): int(counts.get(k, 0)) for k in sorted(VALID_TARGETS)}
+    missing_classes = [k for k, count in info["class_counts"].items() if count == 0]
+    if missing_classes:
+        problems.append(
+            f"[{split}] 이미지가 한 장도 없는 target 클래스: {missing_classes}"
+        )
+    if "experiment_id" in df.columns:
+        info["experiment_ids"] = {
+            str(value).strip() for value in df["experiment_id"].dropna().unique()
+        }
+
+    total = len(df)
+    dist = "  ".join(
+        f"{name} {info['class_counts'][i]:>6} ({info['class_counts'][i]/total*100:5.1f}%)"
+        for i, name in enumerate(["초기", "중기", "후기"])
+    )
+    print(f"[{split}] 이미지 {len(files)}장 / 라벨 {total}행")
+    print(f"         {dist}")
+    print(f"         experiment_id {len(info['experiment_ids'])}개")
+
+    return problems, info
+
+
+def check_leakage(infos):
+    """분할 사이에 같은 experiment_id 또는 image_name이 섞였는지 확인합니다.
+
+    같은 실험의 연속 프레임은 파일명이 달라도 장면이 거의 같습니다.
+    이 프레임들이 train 과 public_val 에 나뉘어 들어가면 모델은
+    '새로운 실험을 이해한 것'이 아니라 '본 장면을 기억한 것'이 됩니다.
+    """
+    problems = []
+    named = {i["split"]: i["experiment_ids"] for i in infos if i is not None}
+    image_named = {i["split"]: i["image_names"] for i in infos if i is not None}
+    keys = sorted(named)
+    for a_idx in range(len(keys)):
+        for b_idx in range(a_idx + 1, len(keys)):
+            a, b = keys[a_idx], keys[b_idx]
+            overlap = named[a] & named[b]  # 두 분할이 공유하는 experiment_id
+            if overlap:
+                problems.append(
+                    f"[누수] {a} 와 {b} 가 experiment_id {len(overlap)}개를 공유합니다 "
+                    f"(예: {sorted(overlap)[:3]})"
+                )
+
+    image_keys = sorted(image_named)
+    for a_idx in range(len(image_keys)):
+        for b_idx in range(a_idx + 1, len(image_keys)):
+            a, b = image_keys[a_idx], image_keys[b_idx]
+            overlap = image_named[a] & image_named[b]
+            if overlap:
+                problems.append(
+                    f"[누수] {a} 와 {b} 가 image_name {len(overlap)}개를 공유합니다 "
+                    f"(예: {sorted(overlap)[:3]})"
+                )
+    return problems
+
+
+def validate_data_root(data_root: Path):
+    """학습 전에 실행할 수 있는 데이터 검사를 수행하고 문제 목록을 돌려줍니다."""
+    if not data_root.is_dir():
+        return [f"데이터 폴더가 없습니다: {data_root.resolve()}"]
+
+    print(f"데이터 검사 시작: {data_root.resolve()}\n" + "-" * 60)
+    problems, infos = [], []
+    for split in SPLITS_WITH_LABELS:
+        p, info = check_split(data_root, split, has_labels=True)
+        problems += p
+        infos.append(info)
+
+    p, info = check_split(data_root, SPLIT_TEST, has_labels=False)
+    if info is None:
+        print(f"[{SPLIT_TEST}] 폴더 없음 (정상 - 참가자에게 배포되지 않는 분할입니다)")
+    else:
+        problems += p
+        infos.append(info)
+
+    problems += check_leakage([i for i in infos if i])
+    print("-" * 60)
+    return problems
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data-root", default="data")
+    args = ap.parse_args()
+
+    data_root = Path(args.data_root)
+    problems = validate_data_root(data_root)
+    if problems:
+        print(f"문제 {len(problems)}건이 발견되었습니다. 학습 전에 해결하세요.\n")
+        for msg in problems:
+            print("  - " + msg)
+        sys.exit(1)
+
+    print("문제 없음. train_baseline.py 를 실행해도 좋습니다.")
+
+
+if __name__ == "__main__":
+    main()
